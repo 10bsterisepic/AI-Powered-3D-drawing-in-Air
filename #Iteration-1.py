@@ -1,22 +1,25 @@
 #Iteration-1
+
+#import cv2 for image processing, mediapipe for gesture tracking and numpy 
 import cv2
 import mediapipe as mp
 import numpy as np
 
+#import hands and drawing_utils functions to recognize hands and respective gestures
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
 
-# Init MediaPipe
+#set parameters and thresholds for Mediapipe to track hand gestures
 hands = mp_hands.Hands(
     max_num_hands=1,
     min_detection_confidence=0.6,
     min_tracking_confidence=0.6
 )
 
-# Storage for strokes
+#store recorded strokes
 all_strokes = []
 current_stroke = []
-drawing = False  # flag for "pen down"
+drawing = False  #flag 
 
 cap = cv2.VideoCapture(0)  # your mobile cam should show up here
 
@@ -73,3 +76,4 @@ while cap.isOpened():
 
 cap.release()
 cv2.destroyAllWindows()
+
