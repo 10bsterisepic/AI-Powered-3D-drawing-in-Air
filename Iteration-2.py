@@ -1,6 +1,6 @@
 #Iteration-2
 # Air Draw v2
-# Requirements: pip install opencv-python mediapipe numpy
+#using palm gesture to stop recording and close the camera and save the strokes as a png image
 
 import cv2
 import mediapipe as mp
