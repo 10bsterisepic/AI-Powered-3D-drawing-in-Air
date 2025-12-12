@@ -1,22 +1,15 @@
-# Air Draw  (MediaPipe with proper start/stop palm gestures)
-# Integrated: OneEuro smoothing + popup label input + simple OBJ 3D exporter
-# Save this as your script and run locally.
-
 import cv2
 import mediapipe as mp
 import numpy as np
-
 import math
 import time
 import os
 import re
 import shutil
 from datetime import datetime
-import tkinter as tk
-from tkinter import simpledialog, messagebox
+from tkinter import Tk, simpledialog
 
-# ------------------------
-# OneEuroFilter (unchanged)
+# smoothing filter for fingertip coordinates
 class OneEuroFilter:
     def __init__(self, freq=120, mincutoff=1.0, beta=0.0, dcutoff=1.0):
         self.freq = freq
@@ -24,40 +17,29 @@ class OneEuroFilter:
         self.beta = beta
         self.dcutoff = dcutoff
         self.last_time = None
-        self.x_prev = None
-        self.dx_prev = None
+        self.prev_value = None
+        self.prev_derivative = None
 
-    def smooth(self, x):
+    def smooth(self, value):
         now = time.time()
-        
         if self.last_time is None:
             self.last_time = now
-            self.x_prev = x
-            self.dx_prev = 0
-            return x
-
+            self.prev_value = value
+            self.prev_derivative = 0.0
+            return value
         dt = now - self.last_time
-        # avoid dt==0
         if dt <= 0:
             dt = 1e-6
         self.last_time = now
-
         freq = 1.0 / dt if dt > 0 else self.freq
-
-        # derivative smoothing
-        dx = (x - self.x_prev) * freq
-        edx = self._exp_smooth(dx, self.dx_prev, self._alpha(freq, self.dcutoff))
-        self.dx_prev = edx
-
-        # variable cutoff that adapts based on the hand speed
-        cutoff = self.mincutoff + self.beta * abs(edx)
+        derivative = (value - self.prev_value) * freq
+        smooth_derivative = self._exp_smooth(derivative, self.prev_derivative, self._alpha(freq, self.dcutoff))
+        self.prev_derivative = smooth_derivative
+        cutoff = self.mincutoff + self.beta * abs(smooth_derivative)
         alpha = self._alpha(freq, cutoff)
-
-        # main smoothing part
-        x_hat = self._exp_smooth(x, self.x_prev, alpha)
-        self.x_prev = x_hat
-
-        return x_hat
+        smooth_value = self._exp_smooth(value, self.prev_value, alpha)
+        self.prev_value = smooth_value
+        return smooth_value
 
     def _exp_smooth(self, x, x_prev, alpha):
         return alpha * x + (1 - alpha) * x_prev
@@ -65,367 +47,260 @@ class OneEuroFilter:
     def _alpha(self, freq, cutoff):
         tau = 1.0 / (2 * math.pi * cutoff)
         return 1.0 / (1.0 + tau * freq)
-# ------------------------
 
+# mediapipe setup
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
 
-recording = False
-all_strokes = []
+# global stroke state
+is_recording = False
+recorded_strokes = []
 current_stroke = []
 
-# ------------------------
-# helper: open palm check (unchanged)
-def is_open_palm(hand_landmarks):
-    """Detect open palm: all fingertips higher than pip joints + thumb extended"""
+# palm gesture detection
+def is_open_palm(hand_landmarks, handedness_hint=None):
     landmarks = hand_landmarks.landmark
-
-    #extended fingers
     fingers_extended = []
-    for tip, pip in [(8, 6), (12, 10), (16, 14), (20, 18)]:
-        fingers_extended.append(landmarks[tip].y < landmarks[pip].y)
+    for tip_idx, pip_idx in [(8, 6), (12, 10), (16, 14), (20, 18)]:
+        fingers_extended.append(landmarks[tip_idx].y < landmarks[pip_idx].y)
+    thumb_left_test = landmarks[4].x < landmarks[3].x
+    thumb_right_test = landmarks[4].x > landmarks[3].x
+    # handedness_hint not always provided; accept either thumb test if unsure
+    if handedness_hint == "Left":
+        thumb_ok = thumb_left_test
+    elif handedness_hint == "Right":
+        thumb_ok = thumb_right_test
+    else:
+        thumb_ok = thumb_left_test or thumb_right_test
+    return all(fingers_extended) and thumb_ok
 
-    # Thumb reference check (this assumes right-hand facing camera; might need adaptation)
-    thumb_extended = landmarks[4].x < landmarks[3].x
-
-    return all(fingers_extended) and thumb_extended
-# ------------------------
-
-# ------------------------
-# save strokes as PNG (unchanged except small path)
-def save_strokes(h, w):
-    """Save strokes as PNG and display"""
-    canvas = np.ones((h, w, 3), dtype=np.uint8) * 255
-    for stroke in all_strokes:
+# save strokes to PNG
+def save_strokes_image(canvas_height, canvas_width, out_name="drawing.png", preview_ms=1000):
+    canvas = np.ones((canvas_height, canvas_width, 3), dtype=np.uint8) * 255
+    for stroke in recorded_strokes:
         for i in range(1, len(stroke)):
             cv2.line(canvas, stroke[i - 1], stroke[i], (0, 0, 0), 2)
-    out_path = "drawing.png"
+    out_path = out_name
     cv2.imwrite(out_path, canvas)
-    print("Saved", out_path)
-
-    # popup (show image for 2 seconds)
-    cv2.imshow("Your Drawing", canvas)
-    cv2.waitKey(2000)  # display for 2 sec
-    cv2.destroyWindow("Your Drawing")
+    print("saved image.")
+    try:
+        cv2.imshow("drawing", canvas)
+        cv2.waitKey(preview_ms)
+        cv2.destroyWindow("drawing")
+    except Exception:
+        pass
     return out_path
-# ------------------------
 
-# ------------------------
-# timestamp and safe label helpers
-def make_timestamp_iso():
-    return datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")[:-3] + "Z"
-
-def safe_label(s):
-    if not s:
+# label helpers
+def sanitize_label(text):
+    if not text:
         return "unknown"
-    s = s.strip().replace(" ", "_")
-    s = re.sub(r"[^A-Za-z0-9_.-]", "", s)
-    return s[:64]
-# ------------------------
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]", "", text.strip().replace(" ", "_"))
+    return cleaned[:64]
 
-# ------------------------
-# Simple Tk popup to ask user for label
-def ask_label_popup(initial_text=""):
-    """
-    Blocks until user enters text or cancels. Returns string (possibly empty).
-    Uses tkinter.simpledialog.
-    """
+def ask_for_label(initial_text=""):
     try:
-        root = tk.Tk()
-        root.withdraw()  # hide main window
-        root.attributes("-topmost", True)
-        answer = simpledialog.askstring("Label", "Enter label for this object (optional):", initialvalue=initial_text, parent=root)
-        root.destroy()
-        if answer is None:
-            return ""
-        return answer.strip()
-    except Exception as e:
-        print("Popup failed (tkinter):", e)
-        return ""
-# ------------------------
-
-# ------------------------
-# Simple OBJ writer: create a tubular mesh (rings along stroke) and write .obj (no external deps)
-def write_tubular_obj(path_pts, out_path="stroke.obj", radius=10.0, radial_segments=12):
-    """
-    path_pts: list of (x, y) in pixel coordinates (or arbitrary units). We'll treat them as 2D and create tubes in a 3D space.
-    radius: tube radius in same units as path_pts (if path_pts are pixels, radius in pixels)
-    radial_segments: number of segments around tube
-    This writes a basic OBJ with vertices and faces. Normals/uv omitted for brevity.
-    """
-    if len(path_pts) < 2:
-        print("Not enough points to create OBJ.")
-        return None
-
-    pts = np.array(path_pts, dtype=float)
-    n = len(pts)
-    seg = radial_segments
-
-    # Create tangents
-    tangents = []
-    for i in range(n):
-        if i == 0:
-            t = pts[1] - pts[0]
-        elif i == n-1:
-            t = pts[-1] - pts[-2]
-        else:
-            t = pts[i+1] - pts[i-1]
-        norm = np.linalg.norm(t)
-        if norm == 0:
-            t = np.array([1.0, 0.0])
-        else:
-            t = t / norm
-        tangents.append(t)
-
-    # choose arbitrary up vector
-    up = np.array([0.0, 0.0, 1.0])
-
-    vertices = []
-    faces = []
-
-    # For each point create a ring in 3D: x->X, y->Y, and Z along 0 (we'll treat 2D stroke living in X-Y plane, sweep along it)
-    for i, p in enumerate(pts):
-        # tangent in XY
-        t2 = np.array([tangents[i][0], tangents[i][1], 0.0])
-        # pick normal via cross with up
-        nvec = np.cross(up, t2)
-        nlen = np.linalg.norm(nvec)
-        if nlen < 1e-6:
-            # choose arbitrary
-            nvec = np.array([1.0, 0.0, 0.0])
-            nlen = 1.0
-        nvec = nvec / nlen
-        bvec = np.cross(t2, nvec)
-        bvec = bvec / (np.linalg.norm(bvec) + 1e-8)
-
-        center = np.array([p[0], p[1], 0.0])
-        for j in range(seg):
-            theta = 2.0 * math.pi * j / seg
-            pos = center + radius * (nvec * math.cos(theta) + bvec * math.sin(theta))
-            vertices.append(tuple(pos.tolist()))
-
-    # connect faces between rings
-    for i in range(n-1):
-        for j in range(seg):
-            a = i * seg + j
-            b = i * seg + (j + 1) % seg
-            c = (i + 1) * seg + (j + 1) % seg
-            d = (i + 1) * seg + j
-            faces.append((a, b, c))
-            faces.append((a, c, d))
-
-    # write OBJ
-    try:
-        with open(out_path, "w") as f:
-            f.write("# Simple tubular OBJ exported by Air Draw\n")
-            for v in vertices:
-                f.write("v {:.6f} {:.6f} {:.6f}\n".format(v[0], v[1], v[2]))
-            for face in faces:
-                # OBJ is 1-indexed
-                f.write("f {} {} {}\n".format(face[0]+1, face[1]+1, face[2]+1))
-        print("Wrote OBJ:", out_path)
-        return out_path
-    except Exception as e:
-        print("Failed to write OBJ:", e)
-        return None
-# ------------------------
-
-def ask_generate_3d_popup():
-    """
-    Shows a Yes/No popup asking if the user accepts the capture (if they want to retry).
-    Returns True if user chooses YES (accept), else False (retry).
-    """
-    try:
-        root = tk.Tk()
+        root = Tk()
         root.withdraw()
         root.attributes("-topmost", True)
-        answer = messagebox.askyesno("Confirm Capture", "Accept this capture? (Yes = keep / No = retry)")
+        answer = simpledialog.askstring("Label", "name (optional):", initialvalue=initial_text, parent=root)
         root.destroy()
-        return bool(answer)
-    except Exception as e:
-        print("Popup failed:", e)
-        return False
+        return answer.strip() if answer else ""
+    except Exception:
+        print("label window failed.")
+        return ""
 
-# ------------------------
-# Helper: convert pixel stroke to approx "camera space" for nicer 3D scaling (optional)
-def pixel_to_working_space(px, py, w, h, scale=1.0):
-    """
-    Convert pixel coords to centered coordinate system (for OBJ export).
-    Returns (x,y) in same units as pixels but centered on canvas.
-    """
-    cx = (px - w / 2.0) * (scale / max(w, h))
-    cy = (h / 2.0 - py) * (scale / max(w, h))  # flip y so up is positive
+# tubular OBJ exporter
+def write_tubular_obj(path_points, out_path="stroke.obj", radius=10.0, radial_segments=12):
+    if len(path_points) < 2:
+        print("not enough points for 3d model.")
+        return None
+    try:
+        pts = np.array(path_points, dtype=float)
+        n = len(pts)
+        seg = int(max(3, radial_segments))
+        tangents = []
+        for i in range(n):
+            if i == 0:
+                t = pts[1] - pts[0]
+            elif i == n - 1:
+                t = pts[-1] - pts[-2]
+            else:
+                t = pts[i + 1] - pts[i - 1]
+            norm = np.linalg.norm(t)
+            tangents.append(t / norm if norm != 0 else np.array([1.0, 0.0]))
+        up = np.array([0.0, 0.0, 1.0])
+        vertices = []
+        faces = []
+        for i, p in enumerate(pts):
+            tangent3 = np.array([tangents[i][0], tangents[i][1], 0.0])
+            normal = np.cross(up, tangent3)
+            if np.linalg.norm(normal) < 1e-6:
+                normal = np.array([1.0, 0.0, 0.0])
+            normal = normal / (np.linalg.norm(normal) + 1e-12)
+            binormal = np.cross(tangent3, normal)
+            binormal = binormal / (np.linalg.norm(binormal) + 1e-12)
+            center = np.array([p[0], p[1], 0.0])
+            for j in range(seg):
+                theta = 2.0 * math.pi * j / seg
+                pos = center + radius * (normal * math.cos(theta) + binormal * math.sin(theta))
+                vertices.append(tuple(pos.tolist()))
+        for i in range(n - 1):
+            for j in range(seg):
+                a = i * seg + j
+                b = i * seg + (j + 1) % seg
+                c = (i + 1) * seg + (j + 1) % seg
+                d = (i + 1) * seg + j
+                faces.append((a, b, c))
+                faces.append((a, c, d))
+        with open(out_path, "w") as f:
+            f.write("# obj file\n")
+            for v in vertices:
+                f.write("v {:.6f} {:.6f} {:.6f}\n".format(v[0], v[1], v[2]))
+            for fa in faces:
+                f.write("f {} {} {}\n".format(fa[0] + 1, fa[1] + 1, fa[2] + 1))
+        print("3d model saved.")
+        return out_path
+    except Exception:
+        print("3d model save failed.")
+        return None
+
+# convert pixel coords into centered coordinate system
+def pixel_to_centered_space(px, py, canvas_width, canvas_height, scale=1.0):
+    cx = (px - canvas_width / 2.0) * (scale / max(canvas_width, canvas_height))
+    cy = (canvas_height / 2.0 - py) * (scale / max(canvas_width, canvas_height))
     return cx, cy
-# ------------------------
 
+# main drawing loop
 def main():
-    global recording, all_strokes, current_stroke
+    global is_recording, recorded_strokes, current_stroke
+    camera = None
+    try:
+        camera = cv2.VideoCapture(0)
+        if not camera.isOpened():
+            print("camera open failed.")
+            return
 
-    cap = cv2.VideoCapture(0)
-    # One Euro smoothing for index fingertip x and y (good defaults for drawing)
-    x_filter = OneEuroFilter(mincutoff=0.7, beta=0.3)
-    y_filter = OneEuroFilter(mincutoff=0.7, beta=0.3)
+        x_filter = OneEuroFilter(mincutoff=0.7, beta=0.3)
+        y_filter = OneEuroFilter(mincutoff=0.7, beta=0.3)
+        canvas_height, canvas_width = None, None
 
-    h, w = None, None
-    palm_prev_state = False  # for gesture toggling
-    palm_stable_counter = 0  # require palm stable for N frames before toggling
-    PALM_STABLE_REQUIRED = 6
+        palm_previous_state = False
+        palm_stable_count = 0
+        PALM_REQUIRED = 6
+        last_toggle_time = 0.0
+        TOGGLE_COOLDOWN = 0.4
 
-    with mp_hands.Hands(
-        max_num_hands=1,
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.6
-    ) as hands:
+        print("camera ready.")
 
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame = cv2.flip(frame, 1)
-            if h is None or w is None:
-                h, w, _ = frame.shape
+        with mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7, min_tracking_confidence=0.6) as hands:
+            while True:
+                ret, frame = camera.read()
+                if not ret:
+                    print("camera feed ended.")
+                    break
+                frame = cv2.flip(frame, 1)
+                if canvas_height is None or canvas_width is None:
+                    canvas_height, canvas_width, _ = frame.shape
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = hands.process(rgb)
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = hands.process(rgb)
 
-            if results.multi_hand_landmarks:
-                for hand_landmarks in results.multi_hand_landmarks:
-                    mp_drawing.draw_landmarks(
-                        frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                palm_open_now = False
+                handedness_hint = None
 
-                    index_tip = hand_landmarks.landmark[8]
+                if results.multi_handedness:
+                    try:
+                        handedness_hint = results.multi_handedness[0].classification[0].label
+                    except Exception:
+                        handedness_hint = None
 
-                    raw_x = index_tip.x * w
-                    raw_y = index_tip.y * h
+                if results.multi_hand_landmarks:
+                    for hand_landmarks in results.multi_hand_landmarks:
+                        mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                        index_tip = hand_landmarks.landmark[8]
+                        raw_x = index_tip.x * canvas_width
+                        raw_y = index_tip.y * canvas_height
+                        smoothed_x = int(x_filter.smooth(raw_x))
+                        smoothed_y = int(y_filter.smooth(raw_y))
+                        palm_open_now = is_open_palm(hand_landmarks, handedness_hint)
+                        palm_stable_count = palm_stable_count + 1 if palm_open_now else 0
 
-                    smooth_x = int(x_filter.smooth(raw_x))
-                    smooth_y = int(y_filter.smooth(raw_y))
-
-                    x, y = smooth_x, smooth_y
-
-                    # gesture detection and recognition with stability hysteresis
-                    palm_now = is_open_palm(hand_landmarks)
-                    if palm_now:
-                        palm_stable_counter += 1
-                    else:
-                        palm_stable_counter = 0
-
-                    if palm_stable_counter >= PALM_STABLE_REQUIRED and palm_now and not palm_prev_state:
-                        # toggle
-                        if not recording:
-                            recording = True
-                            all_strokes = []
-                            current_stroke = []
-                            print("Palm → Recording Started")
-                            cv2.putText(frame, "Recording Started", (50, 100),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
-                            cv2.imshow("Live Feed", frame)
-                            cv2.waitKey(500)
-                        else:
-                            # stop recording
-                            recording = False
-                            # append current stroke if it exists and has enough points
-                            if current_stroke and len(current_stroke) > 1:
-                                all_strokes.append(current_stroke)
-                            current_stroke = []
-
-                            print("✋ Palm → Recording Stopped & Saved")
-                            cv2.putText(frame, "Recording Stopped", (50, 100),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
-                            cv2.imshow("Live Feed", frame)
-                            cv2.waitKey(1000)
-
-                            # Timestamp once (human readable)
-                            base_ts = make_timestamp_iso()
-
-                            # Save PNG once
-                            png_path = save_strokes(h, w)
-
-                            # Ask user to confirm or retry the capture
-                            accepted = ask_generate_3d_popup()
-                            if not accepted:
-                                print("User chose to retry the capture.")
-                                # reset and continue drawing
-                                all_strokes = []
-                                current_stroke = []
-                                recording = False
-                                palm_prev_state = False
-                                palm_stable_counter = 0
-                                continue
-
-                            # 1. Ask for LABEL
-                            user_label = ask_label_popup(initial_text="")
-                            if user_label:
-                                print("User label:", user_label)
+                        now = time.time()
+                        if palm_stable_count >= PALM_REQUIRED and palm_open_now and not palm_previous_state:
+                            if now - last_toggle_time < TOGGLE_COOLDOWN:
+                                pass
                             else:
-                                print("User left label blank")
-
-                            label_safe = safe_label(user_label)
-
-                            # 2. Save dataset copy
-                            try:
-                                os.makedirs("dataset", exist_ok=True)
-                                dest_name = f"{label_safe}_{base_ts}.png"
-                                dest_path = os.path.join("dataset", dest_name)
-                                shutil.copy(png_path, dest_path)
-                                print("Saved labeled example:", dest_path)
-                            except Exception as e:
-                                print("Dataset save failed:", e)
-
-                            # 3. Generate 3D mesh (always generated after accept)
-                            print("▶ Generating 3D mesh...")
-
-                            last_stroke = all_strokes[-1] if all_strokes else None
-                            if last_stroke and len(last_stroke) >= 2:
-
-                                path_pts = []
-                                for (px, py) in last_stroke:
-                                    cx, cy = pixel_to_working_space(px, py, w, h, scale=1.0)
-                                    path_pts.append((cx * max(w, h), cy * max(w, h)))
-
-                                tube_radius = max(w, h) * 0.01
-
-                                os.makedirs("generated", exist_ok=True)
-                                obj_out = os.path.join("generated", f"{label_safe}_{base_ts}.obj")
-
-                                written = write_tubular_obj(path_pts, out_path=obj_out,
-                                                           radius=tube_radius, radial_segments=16)
-                                if written:
-                                    print("Generated OBJ:", written)
+                                last_toggle_time = now
+                                if not is_recording:
+                                    is_recording = True
+                                    recorded_strokes = []
+                                    current_stroke = []
+                                    print("recording started.")
                                 else:
-                                    print("3D generation failed.")
-                            else:
-                                print("No stroke data for 3D.")
+                                    is_recording = False
+                                    if current_stroke:
+                                        recorded_strokes.append(current_stroke)
+                                        current_stroke = []
+                                    print("recording stopped.")
+                                    saved_image = save_strokes_image(canvas_height, canvas_width)
+                                    label_text = ask_for_label("")
+                                    if label_text:
+                                        print(f"label added: {label_text}")
+                                    else:
+                                        print("no label given.")
+                                    try:
+                                        os.makedirs("dataset", exist_ok=True)
+                                        timestamp_ms = int(time.time() * 1000)
+                                        safe_label = sanitize_label(label_text)
+                                        file_name = f"{safe_label}_{timestamp_ms}.png"
+                                        shutil.copy(saved_image, os.path.join("dataset", file_name))
+                                        print("stored copy in dataset.")
+                                    except Exception:
+                                        print("couldn't store a copy.")
+                                    last_stroke = recorded_strokes[-1] if recorded_strokes else None
+                                    if last_stroke and len(last_stroke) >= 2:
+                                        path_points = []
+                                        for px, py in last_stroke:
+                                            cx, cy = pixel_to_centered_space(px, py, canvas_width, canvas_height)
+                                            path_points.append((cx * max(canvas_width, canvas_height),
+                                                                cy * max(canvas_width, canvas_height)))
+                                        os.makedirs("generated", exist_ok=True)
+                                        obj_name = f"{sanitize_label(label_text)}_{timestamp_ms}.obj"
+                                        write_tubular_obj(path_points, out_path=os.path.join("generated", obj_name),
+                                                         radius=max(canvas_width, canvas_height) * 0.01,
+                                                         radial_segments=16)
+                                    else:
+                                        print("not enough points for 3d model.")
 
-                    # update palm_prev_state only when palm went stable low->high or high->low
-                    if palm_stable_counter == 0:
-                        palm_prev_state = False
-                    elif palm_stable_counter >= PALM_STABLE_REQUIRED:
-                        palm_prev_state = True
+                        palm_previous_state = palm_stable_count >= PALM_REQUIRED
 
-                    # stroke recording and drawing
-                    if recording:
-                        # append smoothed fingertip to current stroke
-                        current_stroke.append((x, y))
-                        cv2.circle(frame, (x, y), 6, (0, 255, 0), -1)
-                    else:
-                        # when not recording we just ensure current_stroke is empty
-                        current_stroke = []
+                        if is_recording:
+                            current_stroke.append((smoothed_x, smoothed_y))
+                            cv2.circle(frame, (smoothed_x, smoothed_y), 6, (0, 255, 0), -1)
+                        else:
+                            if len(current_stroke) > 1:
+                                recorded_strokes.append(current_stroke)
+                            current_stroke = []
 
-                    # Draw strokes live on the screen
-                    for stroke in all_strokes:
-                        for i in range(1, len(stroke)):
-                            cv2.line(frame, stroke[i - 1], stroke[i], (255, 0, 0), 2)
-                    for i in range(1, len(current_stroke)):
-                        cv2.line(frame, current_stroke[i - 1], current_stroke[i], (0, 0, 255), 2)
+                        for s in recorded_strokes:
+                            for i in range(1, len(s)):
+                                cv2.line(frame, s[i - 1], s[i], (255, 0, 0), 2)
+                        for i in range(1, len(current_stroke)):
+                            cv2.line(frame, current_stroke[i - 1], current_stroke[i], (0, 0, 255), 2)
 
-            cv2.imshow("Live Feed", frame)
-            if cv2.waitKey(1) & 0xFF == 27:  # esc to exit
-                break
+                cv2.imshow("Live Feed", frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27:
+                    print("closing program.")
+                    break
 
-    cap.release()
-    cv2.destroyAllWindows()
-
+    except KeyboardInterrupt:
+        print("interrupted by user.")
+    finally:
+        if camera is not None:
+            camera.release()
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
